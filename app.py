@@ -105,23 +105,32 @@ async def analyze_chunk_async(model, chunk_name, file_contents, semaphore):
         prompt = f"""
         Analyze the following reStructuredText (reST) content from the docs section: '{chunk_name}'. 
         Identify repetitive phrases, UI navigation steps, or standard warnings that would make good reST substitutions.
-        Return ONLY a valid JSON list of dictionaries with this format:
+        Return ONLY a JSON list of dictionaries with this exact format:
         [
           {{"tag": "|Suggested Tag Name|", "text": "The repetitive text to be replaced", "approved": false}}
         ]
+        
         Content:
         {file_contents}
         """
         try:
-            response = await model.generate_content_async(prompt)
-            json_text = response.text.replace('```json', '').replace('```', '').strip()
-            return json.loads(json_text)
+            # Force the model to return strict JSON
+            response = await model.generate_content_async(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json"
+                )
+            )
+            return json.loads(response.text)
+            
         except Exception as e:
-            print(f"Error analyzing chunk '{chunk_name}': {e}")
+            # Surface the error to the Streamlit UI
+            st.toast(f"⚠️ Error analyzing chunk '{chunk_name}': {e}")
             return []
 
 async def process_all_chunks_concurrently(logical_chunks):
-    model = genai.GenerativeModel('gemini-1.5-pro')
+    # Update model name here if you want to test 'gemini-2.5-pro'
+    model = genai.GenerativeModel('gemini-2.5-pro') 
     semaphore = asyncio.Semaphore(5) 
     tasks = []
     
@@ -132,7 +141,7 @@ async def process_all_chunks_concurrently(logical_chunks):
                 with open(path, 'r', encoding='utf-8') as f:
                     combined_content += f"\n\n--- FILE: {os.path.basename(path)} ---\n" + f.read()
             except Exception as e:
-                print(f"Error reading file {path}: {e}")
+                st.toast(f"⚠️ Error reading file {path}: {e}")
         
         if combined_content.strip():
             tasks.append(asyncio.create_task(analyze_chunk_async(model, chunk_name, combined_content, semaphore)))
