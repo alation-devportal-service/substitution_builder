@@ -124,13 +124,12 @@ async def analyze_chunk_async(model, chunk_name, file_contents, semaphore):
             return json.loads(response.text)
             
         except Exception as e:
-            # Surface the error to the Streamlit UI
             st.toast(f"⚠️ Error analyzing chunk '{chunk_name}': {e}")
             return []
 
 async def process_all_chunks_concurrently(logical_chunks):
-    # Update model name here if you want to test 'gemini-2.5-pro'
-    model = genai.GenerativeModel('gemini-2.5-pro') 
+    # Adjust model name if needed (e.g., 'gemini-2.5-pro' if available)
+    model = genai.GenerativeModel('gemini-1.5-pro-latest') 
     semaphore = asyncio.Semaphore(5) 
     tasks = []
     
@@ -157,7 +156,46 @@ async def process_all_chunks_concurrently(logical_chunks):
     unique_suggestions = {item['text']: item for item in all_suggestions if 'text' in item and len(item['text']) > 10}.values()
     return list(unique_suggestions)
 
-# --- 4. SAFE REGEX WRITER ---
+# --- 4. DATA ENRICHMENT (COUNTS & FILES) ---
+def enrich_suggestions_with_counts(base_path, suggestions):
+    """
+    Sweeps the local directory to count exact occurrences of the suggested text
+    and records the relative file paths where they were found.
+    """
+    for item in suggestions:
+        item['occurrences'] = 0
+        item['files_found'] = []
+        
+    for root, _, files in os.walk(base_path):
+        for file in files:
+            if file.endswith('.rst') and file != "substitutions.rst":
+                file_path = os.path.join(root, file)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        
+                    for item in suggestions:
+                        count = content.count(item['text'])
+                        if count > 0:
+                            item['occurrences'] += count
+                            rel_path = os.path.relpath(file_path, base_path).replace("\\", "/")
+                            if rel_path not in item['files_found']:
+                                item['files_found'].append(rel_path)
+                except Exception as e:
+                    st.toast(f"⚠️ Error reading {file_path} for counts: {e}")
+                    
+    enriched_suggestions = []
+    for item in suggestions:
+        item['files_found'] = ", ".join(item['files_found'])
+        # Filter: Only keep suggestions that appear 2 or more times
+        if item['occurrences'] > 1:
+            enriched_suggestions.append(item)
+            
+    # Sort highest frequency first
+    enriched_suggestions = sorted(enriched_suggestions, key=lambda x: x['occurrences'], reverse=True)
+    return enriched_suggestions
+
+# --- 5. SAFE REGEX WRITER ---
 def apply_substitutions_safely(base_path, approved_items):
     sub_file_path = os.path.join(base_path, "substitutions.rst")
     with open(sub_file_path, 'a', encoding='utf-8') as f:
@@ -181,16 +219,15 @@ def apply_substitutions_safely(base_path, approved_items):
                     with open(file_path, 'w', encoding='utf-8') as f:
                         f.write(content)
 
-# --- 5. MAIN UI WORKFLOW ---
+# --- 6. MAIN UI WORKFLOW ---
 def main():
     
-    # STAGE 0: REPOSITORY SETUP (Manual Clone/Pull)
+    # STAGE 0: REPOSITORY SETUP
     st.write("### 0. Repository Setup")
     
     if st.button("⬇️ Clone / Pull Latest Docs Repository"):
         with st.spinner("Fetching repository data... this might take a moment."):
             try:
-                # Check if repo is already cloned locally
                 if not os.path.exists(os.path.join(REPO_DIR, ".git")):
                     auth_url = f"https://oauth2:{GITHUB_PAT}@{REPO_URL}"
                     git.Repo.clone_from(auth_url, REPO_DIR)
@@ -200,30 +237,24 @@ def main():
                     repo.remotes.origin.pull()
                     st.success("Repository pulled and is up to date!")
                     
-                # Store a flag in session state so the UI stays visible after interacting with other elements
                 st.session_state['repo_ready'] = True
             except Exception as e:
                 st.error(f"Failed to fetch repository. Check your PAT and REPO_URL. Error: {e}")
 
-    # Only show the rest of the application if the repository is successfully fetched
+    # Only show the rest if repo is fetched
     if st.session_state.get('repo_ready', False) or os.path.exists(os.path.join(REPO_DIR, ".git")):
-        
         st.divider()
         repo = git.Repo(REPO_DIR)
 
-        # Get ALL nested directories in the repo (ignoring hidden folders like .git)
+        # Deep directory scan
         all_subdirs = []
         for root, dirs, files in os.walk(REPO_DIR):
-            # Modify dirs in-place to prevent os.walk from diving into hidden directories
             dirs[:] = [d for d in dirs if not d.startswith('.')]
-            
-            # Calculate the relative path to display nicely in the dropdown
             if root != REPO_DIR:
                 rel_path = os.path.relpath(root, REPO_DIR).replace("\\", "/")
                 all_subdirs.append(rel_path)
                 
-        all_subdirs.sort() # Alphabetize the list for easier reading
-        
+        all_subdirs.sort() 
         selected_folder = st.selectbox("Select Project Folder to Analyze", ["/ (Root)"] + all_subdirs)
 
         target_path = REPO_DIR if selected_folder == "/ (Root)" else os.path.join(REPO_DIR, selected_folder)
@@ -239,9 +270,13 @@ def main():
                     else:
                         st.info(f"Successfully mapped {len(logical_chunks)} logical sections from index.rst files.")
                         
-                    all_suggestions = asyncio.run(process_all_chunks_concurrently(logical_chunks))
-                    st.session_state['suggestions'] = all_suggestions
-                    st.success(f"Found {len(all_suggestions)} unique substitution candidates!")
+                    raw_suggestions = asyncio.run(process_all_chunks_concurrently(logical_chunks))
+                    
+                    # Enrich with counts and file paths
+                    enriched_suggestions = enrich_suggestions_with_counts(target_path, raw_suggestions)
+                    
+                    st.session_state['suggestions'] = enriched_suggestions
+                    st.success(f"Found {len(enriched_suggestions)} high-value substitution candidates!")
                 except Exception as e:
                     st.error(f"Analysis failed: {e}")
 
@@ -254,37 +289,29 @@ def main():
             
             st.write("### 3. Version Control & Pull Request")
             
-            # Dynamically fetch available branches from the remote repository
+            # Fetch branches
             try:
                 remote_refs = repo.remote().refs
                 available_branches = list(set([ref.name.replace('origin/', '') for ref in remote_refs if ref.name != 'origin/HEAD']))
                 
-                # Bring 'main' or 'master' to the top of the list as the default option
                 if 'main' in available_branches:
                     available_branches.insert(0, available_branches.pop(available_branches.index('main')))
                 elif 'master' in available_branches:
                     available_branches.insert(0, available_branches.pop(available_branches.index('master')))
             except Exception:
-                # Safe fallback if fetching fails
                 available_branches = ["main", "master"]
 
-            # Use columns for a cleaner UI layout
             col1, col2 = st.columns(2)
             
             with col1:
-                # Let the user define the new branch name
                 raw_branch_name = st.text_input("New Branch Name (Head)", value="feature/ai-docs-update")
-                # Sanitize the branch name
                 safe_branch_name = re.sub(r'[^a-zA-Z0-9.\-_/]', '', raw_branch_name.replace(" ", "-"))
-                
                 if safe_branch_name != raw_branch_name:
                     st.caption(f"ℹ️ *Sanitized to:* `{safe_branch_name}`")
 
             with col2:
-                # Let the user select the target branch for the PR
                 base_branch = st.selectbox("Target Branch (Base)", options=available_branches)
 
-            # Execution Button
             if st.button("Apply Approved Substitutions & Create PR"):
                 approved_items = [item for item in edited_df if item.get('approved') == True]
                 
@@ -295,12 +322,11 @@ def main():
                 else:
                     with st.spinner(f"Applying changes and creating PR from `{safe_branch_name}` into `{base_branch}`..."):
                         try:
-                            # Apply changes via Python Regex
+                            # Safely replace text
                             apply_substitutions_safely(target_path, approved_items)
                             
-                            # Git checkout & commit
+                            # Git logic
                             branch_name = safe_branch_name
-                            
                             if branch_name not in [b.name for b in repo.branches]:
                                 repo.git.checkout('-b', branch_name)
                             else:
@@ -309,11 +335,10 @@ def main():
                             repo.git.add(A=True)
                             repo.index.commit("docs: apply AI suggested reST substitutions")
                             
-                            # Push to origin
                             origin = repo.remote(name='origin')
                             origin.push(refspec=f'{branch_name}:{branch_name}')
                             
-                            # Create Pull Request via GitHub API
+                            # PR logic
                             gh_repo_path = REPO_URL.replace("github.com/", "").replace(".git", "")
                             g = Github(GITHUB_PAT)
                             gh_repo = g.get_repo(gh_repo_path)
@@ -326,7 +351,6 @@ def main():
                                 "Please review the changes to ensure the AI-suggested Regex replacements did not disrupt formatting."
                             )
                             
-                            # Open the PR against the selected base branch
                             pr = gh_repo.create_pull(
                                 title=pr_title, 
                                 body=pr_body, 
@@ -337,7 +361,6 @@ def main():
                             st.success(f"🎉 Successfully applied substitutions, pushed branch, and created PR!")
                             st.markdown(f"**👉 [Click here to review your Pull Request]({pr.html_url})**")
                             
-                            # Clear session state so user can start fresh
                             del st.session_state['suggestions']
                             
                         except Exception as e:
