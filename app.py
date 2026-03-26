@@ -9,8 +9,8 @@ import google.generativeai as genai
 import tempfile
 
 # --- 1. SETUP & SECRETS ---
-st.set_page_config(page_title="AI reST Substitution Builder", layout="wide")
-st.title("🤖 AI reST Substitution Builder")
+st.set_page_config(page_title="Alation Substitution Builder", layout="wide")
+st.title("Alation Substitution Builder")
 
 # Fetch secrets (Configured in Streamlit Cloud settings)
 GITHUB_PAT = st.secrets.get("GITHUB_PAT")
