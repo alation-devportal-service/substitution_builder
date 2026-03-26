@@ -129,7 +129,7 @@ async def analyze_chunk_async(model, chunk_name, file_contents, semaphore):
 
 async def process_all_chunks_concurrently(logical_chunks):
     # Adjust model name if needed (e.g., 'gemini-2.5-pro' if available)
-    model = genai.GenerativeModel('gemini-1.5-pro-latest') 
+    model = genai.GenerativeModel('gemini-2.5-pro') 
     semaphore = asyncio.Semaphore(5) 
     tasks = []
     
