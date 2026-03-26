@@ -21,8 +21,6 @@ genai.configure(api_key=GEMINI_API_KEY)
 REPO_DIR = os.path.join(tempfile.gettempdir(), "docs_repo")
 
 # --- REGEX TO ISOLATE SPHINX META BLOCKS ---
-# Matches '.. meta::' and all subsequent indented lines or blank lines 
-# until the indentation returns to the root level.
 META_BLOCK_REGEX = re.compile(r'(^[ \t]*\.\. meta::[ \t]*(?:\n|$)(?:[ \t]+.*(?:\n|$)|[ \t]*(?:\n|$))*)', re.MULTILINE)
 
 # --- 2. RECURSIVE SPHINX PARSER ---
@@ -126,7 +124,6 @@ async def process_all_chunks_concurrently(logical_chunks):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     raw_content = f.read()
-                    # Strip out meta blocks before giving to AI so it doesn't analyze them
                     clean_content = META_BLOCK_REGEX.sub('', raw_content)
                     combined_content += f"\n\n--- FILE: {os.path.basename(path)} ---\n" + clean_content
             except Exception as e:
@@ -158,7 +155,6 @@ def enrich_suggestions_with_counts(base_path, suggestions):
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         raw_content = f.read()
-                        # Strip meta blocks so we don't count occurrences hiding inside them
                         clean_content = META_BLOCK_REGEX.sub('', raw_content)
                         
                     for item in suggestions:
@@ -180,13 +176,54 @@ def enrich_suggestions_with_counts(base_path, suggestions):
     enriched_suggestions = sorted(enriched_suggestions, key=lambda x: x['occurrences'], reverse=True)
     return enriched_suggestions
 
-# --- 5. SAFE REGEX WRITER ---
-def apply_substitutions_safely(base_path, approved_items):
+# --- 5. SAFE REGEX WRITER & INJECTOR ---
+def get_insertion_index(content):
+    """
+    Finds the index to inject the include statement. 
+    Skips past the header, the meta block, and any existing include statements.
+    """
+    header_end = 0
+    m_over = re.search(r'^([=~\-\*\+\^\#]{3,})\n[^\n]+\n\1\n', content, re.MULTILINE)
+    m_under = re.search(r'^([^\n]+)\n([=~\-\*\+\^\#]{3,})\n', content, re.MULTILINE)
+    
+    if m_over and m_under:
+        header_end = min(m_over.end(), m_under.end())
+    elif m_over:
+        header_end = m_over.end()
+    elif m_under:
+        header_end = m_under.end()
+        
+    m_meta = META_BLOCK_REGEX.search(content)
+    meta_end = 0
+    if m_meta and m_meta.start() < max(header_end, 500):
+        meta_end = m_meta.end()
+        
+    base_index = max(header_end, meta_end)
+    
+    # Scan forward to skip past any existing `.. include::` statements
+    tail = content[base_index:]
+    current_tail_index = 0
+    
+    while True:
+        # Match optional blank lines followed by an include statement
+        m_inc = re.match(r'([ \t]*\n)*[ \t]*\.\. include::[^\n]*(?:\n|$)', tail[current_tail_index:])
+        if m_inc:
+            current_tail_index += m_inc.end()
+        else:
+            break
+            
+    return base_index + current_tail_index
+
+def apply_substitutions_safely(repo_root, base_path, approved_items):
     sub_file_path = os.path.join(base_path, "substitutions.rst")
+    
     with open(sub_file_path, 'a', encoding='utf-8') as f:
         f.write("\n\n.. Auto-generated AI Substitutions\n")
         for item in approved_items:
             f.write(f".. {item['tag']} replace:: {item['text']}\n")
+
+    rel_sub_path = os.path.relpath(sub_file_path, repo_root).replace("\\", "/")
+    include_statement = f".. include:: /{rel_sub_path}"
 
     for root, _, files in os.walk(base_path):
         for file in files:
@@ -195,22 +232,28 @@ def apply_substitutions_safely(base_path, approved_items):
                 with open(file_path, 'r', encoding='utf-8') as f:
                     original_content = f.read()
                 
-                # Split the document into alternating chunks of [Text, Meta Block, Text, Meta Block...]
                 parts = META_BLOCK_REGEX.split(original_content)
                 new_parts = []
                 
                 for i, part in enumerate(parts):
-                    # Even indexes are standard text. Odd indexes are the protected Meta blocks.
                     if i % 2 == 0:
                         for item in approved_items:
                             escaped_old_text = re.escape(item['text'])
                             part = re.sub(escaped_old_text, item['tag'], part)
                     new_parts.append(part)
                 
-                # Stitch the document back together perfectly
                 content = "".join(new_parts)
                 
                 if content != original_content:
+                    if include_statement not in content:
+                        insert_pos = get_insertion_index(content)
+                        
+                        # Cleanly separate the injection from surrounding text
+                        before = content[:insert_pos].rstrip()
+                        after = content[insert_pos:].lstrip()
+                        
+                        content = f"{before}\n\n{include_statement}\n\n{after}\n"
+                        
                     with open(file_path, 'w', encoding='utf-8') as f:
                         f.write(content)
 
@@ -308,7 +351,8 @@ def main():
                 else:
                     with st.spinner(f"Applying changes and creating PR from `{safe_branch_name}` into `{base_branch}`..."):
                         try:
-                            apply_substitutions_safely(target_path, approved_items)
+                            # Note: Passing REPO_DIR here to properly construct the absolute Sphinx path
+                            apply_substitutions_safely(REPO_DIR, target_path, approved_items)
                             
                             branch_name = safe_branch_name
                             if branch_name not in [b.name for b in repo.branches]:
