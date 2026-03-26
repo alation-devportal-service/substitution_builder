@@ -7,18 +7,15 @@ import git
 from github import Github
 import google.generativeai as genai
 import tempfile
+import hashlib
 
 # --- 1. SETUP & SECRETS ---
 st.set_page_config(page_title="Alation Substitution Builder", layout="wide")
 st.title("Alation Substitution Builder")
 
-# Fetch secrets (Configured in Streamlit Cloud settings)
-GITHUB_PAT = st.secrets.get("GITHUB_PAT")
-REPO_URL = st.secrets.get("REPO_URL") 
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
-
-genai.configure(api_key=GEMINI_API_KEY)
-REPO_DIR = os.path.join(tempfile.gettempdir(), "docs_repo")
+# We only fetch the REPO_URL from secrets now, since it is shared for the whole team.
+# Format MUST be: github.com/yourorg/yourrepo.git (No https://)
+REPO_URL = st.secrets.get("REPO_URL", "github.com/your-org/your-repo.git")
 
 # --- REGEX TO ISOLATE SPHINX META BLOCKS ---
 META_BLOCK_REGEX = re.compile(r'(^[ \t]*\.\. meta::[ \t]*(?:\n|$)(?:[ \t]+.*(?:\n|$)|[ \t]*(?:\n|$))*)', re.MULTILINE)
@@ -178,10 +175,6 @@ def enrich_suggestions_with_counts(base_path, suggestions):
 
 # --- 5. SAFE REGEX WRITER & INJECTOR ---
 def get_insertion_index(content):
-    """
-    Finds the index to inject the include statement. 
-    Skips past the header, the meta block, and any existing include statements.
-    """
     header_end = 0
     m_over = re.search(r'^([=~\-\*\+\^\#]{3,})\n[^\n]+\n\1\n', content, re.MULTILINE)
     m_under = re.search(r'^([^\n]+)\n([=~\-\*\+\^\#]{3,})\n', content, re.MULTILINE)
@@ -200,12 +193,10 @@ def get_insertion_index(content):
         
     base_index = max(header_end, meta_end)
     
-    # Scan forward to skip past any existing `.. include::` statements
     tail = content[base_index:]
     current_tail_index = 0
     
     while True:
-        # Match optional blank lines followed by an include statement
         m_inc = re.match(r'([ \t]*\n)*[ \t]*\.\. include::[^\n]*(?:\n|$)', tail[current_tail_index:])
         if m_inc:
             current_tail_index += m_inc.end()
@@ -247,11 +238,8 @@ def apply_substitutions_safely(repo_root, base_path, approved_items):
                 if content != original_content:
                     if include_statement not in content:
                         insert_pos = get_insertion_index(content)
-                        
-                        # Cleanly separate the injection from surrounding text
                         before = content[:insert_pos].rstrip()
                         after = content[insert_pos:].lstrip()
-                        
                         content = f"{before}\n\n{include_statement}\n\n{after}\n"
                         
                     with open(file_path, 'w', encoding='utf-8') as f:
@@ -259,23 +247,47 @@ def apply_substitutions_safely(repo_root, base_path, approved_items):
 
 # --- 6. MAIN UI WORKFLOW ---
 def main():
+    # --- UI CREDENTIAL INJECTION ---
+    with st.sidebar:
+        st.header("🔑 Credentials Setup")
+        st.markdown("Enter your personal credentials to use the app. These are not stored persistently.")
+        
+        github_pat = st.text_input("GitHub PAT", type="password", help="Requires 'repo' scope to push and create PRs.")
+        gemini_key = st.text_input("Gemini API Key", type="password", help="Your personal Google AI Studio key.")
+    
+    if not github_pat or not gemini_key:
+        st.warning("👈 Please enter your GitHub PAT and Gemini API Key in the sidebar to continue.")
+        st.stop()
+        
+    # Dynamically configure Gemini for this user's session
+    genai.configure(api_key=gemini_key)
+    
+    # Create a unique temporary directory for this specific user using a hash of their PAT.
+    # This prevents Git credential collisions if multiple teammates use the Streamlit app simultaneously.
+    user_hash = hashlib.md5(github_pat.encode()).hexdigest()[:8]
+    REPO_DIR = os.path.join(tempfile.gettempdir(), f"docs_repo_{user_hash}")
+
     st.write("### 0. Repository Setup")
     
     if st.button("⬇️ Clone / Pull Latest Docs Repository"):
         with st.spinner("Fetching repository data... this might take a moment."):
             try:
+                # Use the user's personal PAT in the clone URL
+                auth_url = f"https://oauth2:{github_pat}@{REPO_URL}"
+                
                 if not os.path.exists(os.path.join(REPO_DIR, ".git")):
-                    auth_url = f"https://oauth2:{GITHUB_PAT}@{REPO_URL}"
                     git.Repo.clone_from(auth_url, REPO_DIR)
                     st.success("Repository cloned successfully!")
                 else:
                     repo = git.Repo(REPO_DIR)
+                    # Dynamically update the remote URL in case they changed their PAT
+                    repo.remotes.origin.set_url(auth_url)
                     repo.remotes.origin.pull()
                     st.success("Repository pulled and is up to date!")
                     
                 st.session_state['repo_ready'] = True
             except Exception as e:
-                st.error(f"Failed to fetch repository. Check your PAT and REPO_URL. Error: {e}")
+                st.error(f"Failed to fetch repository. Check your PAT and ensure you have access to `{REPO_URL}`. Error: {e}")
 
     if st.session_state.get('repo_ready', False) or os.path.exists(os.path.join(REPO_DIR, ".git")):
         st.divider()
@@ -351,7 +363,6 @@ def main():
                 else:
                     with st.spinner(f"Applying changes and creating PR from `{safe_branch_name}` into `{base_branch}`..."):
                         try:
-                            # Note: Passing REPO_DIR here to properly construct the absolute Sphinx path
                             apply_substitutions_safely(REPO_DIR, target_path, approved_items)
                             
                             branch_name = safe_branch_name
@@ -363,11 +374,15 @@ def main():
                             repo.git.add(A=True)
                             repo.index.commit("docs: apply AI suggested reST substitutions")
                             
+                            # Authenticate push using the provided PAT
                             origin = repo.remote(name='origin')
+                            auth_url = f"https://oauth2:{github_pat}@{REPO_URL}"
+                            repo.remotes.origin.set_url(auth_url)
                             origin.push(refspec=f'{branch_name}:{branch_name}')
                             
+                            # Authenticate GitHub PR creation using the provided PAT
                             gh_repo_path = REPO_URL.replace("github.com/", "").replace(".git", "")
-                            g = Github(GITHUB_PAT)
+                            g = Github(github_pat)
                             gh_repo = g.get_repo(gh_repo_path)
                             
                             pr_title = f"Docs: AI Suggested reST Substitutions from '{branch_name}'"
