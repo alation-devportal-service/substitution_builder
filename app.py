@@ -8,14 +8,19 @@ from github import Github
 import google.generativeai as genai
 import tempfile
 import hashlib
+import shutil
 
 # --- 1. SETUP & SECRETS ---
 st.set_page_config(page_title="Alation Substitution Builder", layout="wide")
 st.title("Alation Substitution Builder")
 
-# We only fetch the REPO_URL from secrets now, since it is shared for the whole team.
-# Format MUST be: github.com/yourorg/yourrepo.git (No https://)
+# Fetch REPO_URL from secrets.
 REPO_URL = st.secrets.get("REPO_URL", "github.com/your-org/your-repo.git")
+
+# Validate REPO_URL to prevent silent cloning failures
+if "your-org/your-repo" in REPO_URL:
+    st.error("🚨 Configuration Error: The `REPO_URL` is set to the default placeholder. Please update your Streamlit Secrets with your actual repository URL.")
+    st.stop()
 
 # --- REGEX TO ISOLATE SPHINX META BLOCKS ---
 META_BLOCK_REGEX = re.compile(r'(^[ \t]*\.\. meta::[ \t]*(?:\n|$)(?:[ \t]+.*(?:\n|$)|[ \t]*(?:\n|$))*)', re.MULTILINE)
@@ -89,7 +94,13 @@ async def analyze_chunk_async(model, chunk_name, file_contents, semaphore):
     async with semaphore:
         prompt = f"""
         Analyze the following reStructuredText (reST) content from the docs section: '{chunk_name}'. 
-        Identify repetitive phrases, UI navigation steps, or standard warnings that would make good reST substitutions.
+        Identify repetitive INLINE phrases or UI navigation steps that would make good reST substitutions.
+        
+        CRITICAL RULES:
+        1. DO NOT select multi-line blocks, paragraphs, or numbered lists.
+        2. The 'text' value MUST be a single, flat string with no line breaks (\\n).
+        3. Capture WHOLE sentences or complete logical phrases including their preceding/trailing punctuation. Do not leave orphaned commas or periods behind.
+        
         Return ONLY a JSON list of dictionaries with this exact format:
         [
           {{"tag": "|Suggested Tag Name|", "text": "The repetitive text to be replaced", "approved": false}}
@@ -115,10 +126,17 @@ async def process_all_chunks_concurrently(logical_chunks):
     semaphore = asyncio.Semaphore(5) 
     tasks = []
     
+    # 1MB file size limit to prevent OOM errors
+    MAX_FILE_SIZE = 1 * 1024 * 1024 
+    
     for chunk_name, file_paths in logical_chunks.items():
         combined_content = ""
         for path in set(file_paths):
             try:
+                if os.path.getsize(path) > MAX_FILE_SIZE:
+                    st.toast(f"⚠️ Skipping {os.path.basename(path)}: File exceeds 1MB memory limit.")
+                    continue
+                    
                 with open(path, 'r', encoding='utf-8') as f:
                     raw_content = f.read()
                     clean_content = META_BLOCK_REGEX.sub('', raw_content)
@@ -211,7 +229,9 @@ def apply_substitutions_safely(repo_root, base_path, approved_items):
     with open(sub_file_path, 'a', encoding='utf-8') as f:
         f.write("\n\n.. Auto-generated AI Substitutions\n")
         for item in approved_items:
-            f.write(f".. {item['tag']} replace:: {item['text']}\n")
+            # Flatten the text: replace newlines with spaces and collapse extra whitespace
+            flat_text = re.sub(r'\s+', ' ', item['text']).strip()
+            f.write(f".. {item['tag']} replace:: {flat_text}\n")
 
     rel_sub_path = os.path.relpath(sub_file_path, repo_root).replace("\\", "/")
     include_statement = f".. include:: /{rel_sub_path}"
@@ -242,28 +262,39 @@ def apply_substitutions_safely(repo_root, base_path, approved_items):
                         after = content[insert_pos:].lstrip()
                         content = f"{before}\n\n{include_statement}\n\n{after}\n"
                         
+                    # Strip trailing whitespace from every line to prevent doc-lint failures
+                    clean_lines = [line.rstrip() for line in content.splitlines()]
+                    content = "\n".join(clean_lines) + "\n"
+                        
                     with open(file_path, 'w', encoding='utf-8') as f:
                         f.write(content)
 
 # --- 6. MAIN UI WORKFLOW ---
 def main():
-    # --- UI CREDENTIAL INJECTION ---
+    # --- UI CREDENTIAL INJECTION & WORKSPACE CLEANUP ---
     with st.sidebar:
         st.header("🔑 Credentials Setup")
-        st.markdown("Enter your personal credentials to use the app. These are not stored persistently.")
+        st.markdown("Enter your personal credentials to use the app.")
         
         github_pat = st.text_input("GitHub PAT", type="password", help="Requires 'repo' scope to push and create PRs.")
         gemini_key = st.text_input("Gemini API Key", type="password", help="Your personal Google AI Studio key.")
-    
+        
+        # Secure Workspace Cleanup Button
+        if st.button("🚪 Logout & Clean Workspace", type="primary"):
+            if github_pat:
+                user_hash = hashlib.md5(github_pat.encode()).hexdigest()[:8]
+                repo_to_clean = os.path.join(tempfile.gettempdir(), f"docs_repo_{user_hash}")
+                if os.path.exists(repo_to_clean):
+                    shutil.rmtree(repo_to_clean, ignore_errors=True)
+            st.session_state.clear()
+            st.rerun()
+
     if not github_pat or not gemini_key:
         st.warning("👈 Please enter your GitHub PAT and Gemini API Key in the sidebar to continue.")
         st.stop()
         
-    # Dynamically configure Gemini for this user's session
     genai.configure(api_key=gemini_key)
     
-    # Create a unique temporary directory for this specific user using a hash of their PAT.
-    # This prevents Git credential collisions if multiple teammates use the Streamlit app simultaneously.
     user_hash = hashlib.md5(github_pat.encode()).hexdigest()[:8]
     REPO_DIR = os.path.join(tempfile.gettempdir(), f"docs_repo_{user_hash}")
 
@@ -272,7 +303,6 @@ def main():
     if st.button("⬇️ Clone / Pull Latest Docs Repository"):
         with st.spinner("Fetching repository data... this might take a moment."):
             try:
-                # Use the user's personal PAT in the clone URL
                 auth_url = f"https://oauth2:{github_pat}@{REPO_URL}"
                 
                 if not os.path.exists(os.path.join(REPO_DIR, ".git")):
@@ -280,7 +310,6 @@ def main():
                     st.success("Repository cloned successfully!")
                 else:
                     repo = git.Repo(REPO_DIR)
-                    # Dynamically update the remote URL in case they changed their PAT
                     repo.remotes.origin.set_url(auth_url)
                     repo.remotes.origin.pull()
                     st.success("Repository pulled and is up to date!")
@@ -374,13 +403,11 @@ def main():
                             repo.git.add(A=True)
                             repo.index.commit("docs: apply AI suggested reST substitutions")
                             
-                            # Authenticate push using the provided PAT
                             origin = repo.remote(name='origin')
                             auth_url = f"https://oauth2:{github_pat}@{REPO_URL}"
                             repo.remotes.origin.set_url(auth_url)
                             origin.push(refspec=f'{branch_name}:{branch_name}')
                             
-                            # Authenticate GitHub PR creation using the provided PAT
                             gh_repo_path = REPO_URL.replace("github.com/", "").replace(".git", "")
                             g = Github(github_pat)
                             gh_repo = g.get_repo(gh_repo_path)
